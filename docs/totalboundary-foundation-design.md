@@ -1,9 +1,11 @@
 # TotalBoundary Clone — 基础版 (Foundation / Tier 1) 详细开发设计
 
-> 版本: v1.0 | 日期: 2026-06-29 | 配套文档: `totalboundary-dev-plan-v2.md`
+> 版本: **v1.1** | 日期: 2026-06-29 | 配套文档: `totalboundary-dev-plan-v2.md`(v2.1)
 >
-> 本文档面向**基础版的可实现详细设计**,目标是用自研算法完整复刻 TotalBoundary 的核心能力:
-> **从一组(近似)封闭的几何中提取闭合边界多段线,且具备超越原生 `BOUNDARY`/`BPOLY` 的间隙容差与中段相交处理能力。**
+> 本文档面向**基础版的可实现详细设计**,目标是用自研算法**忠实复刻 TotalBoundary 的核心能力**:
+> **对用户选定的对象集合,沿其外周界生成闭合多段线(外轮廓),并在内部存在较大空腔时生成孔洞边界;具备超越原生 `BOUNDARY`/`BPOLY` 的间隙容差与中段相交处理能力。**
+>
+> **v1.1 纠偏要点**:核心目标由"提取所有最小内部面"改正为"**外轮廓 + 孔洞提取**";空腔判定采用**路线 B(形态学闭合 / 闭合半径)**;命令体系改为 `TOTALBOUNDARY`/`TBALL`/`TBPICK`。SuperBoundary 式"逐面全提取"不在范围。
 
 ---
 
@@ -14,22 +16,25 @@
 | 能力 | 说明 |
 |------|------|
 | 多类型实体输入 | Line / Arc / Circle / Ellipse / Spline / (LW/2D)Polyline / BlockReference(单层展开) |
-| 间隙容差桥接 | 端点距离 ≤ 容差即视为连接,自动闭合近似封闭图形 |
-| 中段相交处理 | 实体在中段交叉(X/T 形)时正确打断并参与成环 |
-| 闭合环提取 | 提取所有最小闭合面,输出为 `LWPolyline` |
+| 间隙容差桥接 | 端点距离 ≤ 容差即视为连接,自动闭合近似相接处的缝隙 |
+| 中段相交处理 | 实体在中段交叉(X/T 形)时正确打断并参与拓扑 |
+| **外轮廓提取** | 沿选定对象集合的外周界生成闭合 `LWPolyline`(可多片段各自外轮廓) |
+| **孔洞识别(路线 B)** | 内部空腔 > 闭合半径 → 生成孔洞边界;细小单元被填充覆盖,不输出内部边 |
 | 圆弧精确保留 | Arc/Circle 段以 **bulge** 表示,不线性化 |
 | 样条/椭圆线性化 | 按矢高(sagitta)自适应细分,精度可控 |
-| 三个命令 | `TBBOUNDARY`(选择对象)、`TBQUICKPICK`(点选区域)、`TBALL`(全图) |
+| 无需预清理 | 自动忽略孤立悬挂线(不参与轮廓) |
+| 三个命令 | `TOTALBOUNDARY`/`TB`(选对象)、`TBALL`(全图)、`TBPICK`(点选片段轮廓) |
 | 输出属性 | 图层 / 颜色 / 线宽可配置 |
 | 进度与中断 | 大图显示进度,支持 Esc 取消 |
 
-### 1.2 明确不在基础版的内容 (Out of Scope → Pro/ProPlus)
+### 1.2 明确不在基础版的内容 (Out of Scope)
 
+- **SuperBoundary 式"逐个内部面全提取"**(BPOLY 全区域语义)→ 不在 TotalBoundary 复刻范围(可作未来可选模式)
 - 面积/周长计算与孔洞扣除 → Pro
-- Solid Hatch 生成、DXF 导出、批量、INI 持久化 → Pro
+- Solid Hatch 生成、DXF 导出、批量、INI 持久化 → Pro(Solid 填充为 TotalBoundary 宣传特性,基础版预留接口)
 - GUI 配置面板、递归多层块展开、性能面板、许可证 → ProPlus
 
-> 基础版仍**检测**岛屿/孔洞层级(供输出排序与方向),但不做面积扣除。
+> 基础版输出**外轮廓 + 孔洞**;孔洞通过路线 B 的面分类识别,不做面积扣除(面积计算留 Pro)。
 
 ---
 
@@ -37,7 +42,7 @@
 
 ```
 ┌─────────────────────────── TB.AutoCAD (主线程 / STA) ───────────────────────────┐
-│  Command (TBBOUNDARY/QUICKPICK/ALL)                                              │
+│  Command (TOTALBOUNDARY / TBALL / TBPICK)                                        │
 │        │ 1. 取选择集 / 拾取点                                                      │
 │        ▼                                                                          │
 │  EntityExtractor ── 读 DBObject → InputCurve[] (2D 平面坐标 + 反变换矩阵)          │
@@ -45,15 +50,16 @@
          │ POCO (无 CAD 依赖)
          ▼
 ┌─────────────────────────── TB.Core (可后台并行) ──────────────────────────────────┐
-│  BoundaryExtractor.Extract(InputCurve[], BoundaryOptions, IProgress, CT)          │
+│  OutlineExtractorService.Extract(InputCurve[], BoundaryOptions, IProgress, CT)    │
 │     ① Tessellator      曲线 → 直线边 Edge(带 provenance 回溯)                      │
 │     ② SpatialIndex     均匀网格,广相过滤                                          │
 │     ③ SegmentIntersector  线段求交并在交点打断                                     │
 │     ④ VertexMerger     端点容差聚类(间隙桥接)→ Vertex                              │
 │     ⑤ PlanarGraphBuilder  半边(half-edge)结构 + 各顶点出边极角排序                  │
-│     ⑥ FaceTracer       面遍历提取所有最小闭合面 → RawLoop                          │
-│     ⑦ LoopHierarchy    包含树 + 方向归一(外环 CCW / 内环 CW)                       │
-│     ⑧ LoopRebuilder    直线边链 → BoundaryLoop(按 provenance 还原 bulge 圆弧)      │
+│     ⑥ FaceTracer       面遍历得到所有面(含无界外面)→ Face[]                        │
+│     ⑦ FaceClassifier   ★路线 B: 每个有界面按闭合半径分 Solid / Void               │
+│     ⑧ OutlineBuilder   ★取"实边且非两侧皆 Solid"的边 → 外轮廓 + 孔洞环            │
+│     ⑨ LoopRebuilder    直线边链 → BoundaryLoop(按 provenance 还原 bulge 圆弧)      │
 │     └─> BoundaryResult (BoundaryLoop[])                                            │
 └────────┬─────────────────────────────────────────────────────────────────────────┘
          │ POCO
@@ -66,6 +72,7 @@
 **关键设计原则:**
 1. **所有 CAD 读写在主线程**(STA),纯几何运算在 `TB.Core`(POCO,可并行/可单测)。
 2. **统一直线边拓扑 + provenance 回溯**:把所有曲线展平为直线边做拓扑,既让相交/成环只需处理"线段-线段"(健壮、单一代码路径),又能在输出时凭来源把圆弧还原为精确 bulge。
+3. **核心是"并集外轮廓",非"逐个内部面"**:⑥ 得到所有面后,⑦ 用路线 B 把面分为 Solid/Void,⑧ 仅输出 Solid 与非 Solid 之间(及孤立闭环)的实体边 = 外轮廓 + 孔洞。
 
 ---
 
@@ -139,16 +146,20 @@ public sealed class InputCurve
 ```csharp
 public sealed class BoundaryOptions
 {
-    public double GapTolerance { get; init; } = 0.001;   // 端点桥接容差(绘图单位)
-    public double MaxSagitta   { get; init; } = 0.0;     // 0=按尺寸自适应; >0 固定最大弦高
+    public double GapTolerance  { get; init; } = 0.001;  // 端点桥接容差(绘图单位)
+    public double ClosingRadius { get; init; } = 0.0;    // 路线 B 闭合半径 r; 0=按 GapTolerance 自适应(≈2–5×)
+    public double MaxSagitta    { get; init; } = 0.0;    // 0=按尺寸自适应; >0 固定最大弦高
     public double MaxArcStepDeg { get; init; } = 15.0;   // 线性化最大角步进
-    public double GeomEpsilon  { get; init; } = 1e-9;    // 浮点比较基准(按包围盒缩放)
-    public bool   IncludeOuterFace { get; init; } = false; // 是否输出最外无界面边界
-    public ExtractMode Mode { get; init; } = ExtractMode.AllLoops;
+    public double GeomEpsilon   { get; init; } = 1e-9;   // 浮点比较基准(按包围盒缩放)
+    public ExtractMode Mode { get; init; } = ExtractMode.SelectedObjects;
 }
 
-public enum ExtractMode { AllLoops, PointPick }
+// SelectedObjects: 对所选对象整体出外轮廓+孔洞
+// FragmentAtPoint: 仅对拾取点所在的连通线工片段出轮廓(TBPICK)
+public enum ExtractMode { SelectedObjects, FragmentAtPoint }
 ```
+
+> **闭合半径 ClosingRadius (r) 是路线 B 的关键参数**:有界面的最大内切空圆半径 > r 视为孔洞(Void),≤ r 视为被填充(Solid)。r 越大,轮廓越平滑、孔越少;r 越小,越多内部空腔被保留为孔。默认按 `GapTolerance` 自适应放大。
 
 ### 4.3 输出 DTO
 
@@ -183,12 +194,12 @@ public sealed class BoundaryResult
 ```csharp
 namespace TB.Core;
 
-public interface IBoundaryExtractor
+public interface IBoundaryExtractor   // 门面; 实现类 OutlineExtractorService
 {
     BoundaryResult Extract(
         IReadOnlyList<InputCurve> curves,
         BoundaryOptions options,
-        Point2d? pickPoint,                 // PointPick 模式下的拾取点
+        Point2d? pickPoint,                 // FragmentAtPoint 模式下的拾取点
         IProgress<ProgressInfo>? progress,
         CancellationToken cancellationToken);
 }
@@ -307,42 +318,78 @@ internal sealed class HalfEdge
 - 对每个顶点,收集所有**出边半边**并按 `Angle` 升序排序,存入 `vertexOutgoing[v]`(用于 5.6 选下一条边)。
 - 去除重复半边(同一对顶点间的重复几何边在预处理已合并)。
 
-### 5.6 ⑥ FaceTracer — 面遍历提取闭合环
+### 5.6 ⑥ FaceTracer — 面遍历得到所有面
 
-采用平面图面遍历(非 Hierholzer):
+采用平面图面遍历(DCEL 标准做法,非 Hierholzer),目的是得到**平面细分的所有面**(供 ⑦ 分类),不是直接当作输出环。
 
 ```
 for each half-edge he not visited:
-    loop = []
+    face = []
     cur = he
     repeat:
         mark cur visited
-        loop.append(cur)
+        face.append(cur)
         # 在 cur.Dest 处,选"紧邻 cur 反向边的下一条(顺时针)出边"
         twinAngle = angle(cur.Twin)                 # 即 Dest→Origin 方向
         outs = vertexOutgoing[cur.Dest]             # 已按角排序
         next = outs 中角度 == twinAngle 的项的"前一个"(环形, 顺时针下一条)
         cur = next
     until cur == he
-    record RawLoop(loop)
+    record Face(face)            # 记录构成该面的半边序列
+# 为每条无向边登记其左面/右面(faceLeft, faceRight)
 ```
 
 - 该规则遍历出平面细分的**所有面**(含最外无界面)。
-- 每个 `RawLoop` 用**有符号面积**(Shoelace)判定朝向:`area>0` 为 CCW,`area<0` 为 CW。
-- **最外无界面**:其有符号面积为所有面中绝对值最大且方向相反者,或可由"包含所有其它面"判定;依 `IncludeOuterFace` 决定是否丢弃。
-- 仅由开放链(非闭合)构成、无法回到起点的半边不会形成有效面 → 自然排除。
+- 每个 `Face` 用**有符号面积**(Shoelace)判定朝向并计算面积;**最外无界面**为有符号面积为负(或绝对值最大方向相反)者。
+- 仅由开放链构成、无法回到起点的悬挂边不会形成有效面 → 自然排除(对应"忽略悬挂线")。
+- **关键**:同时为每条几何边记录其两侧面(`faceLeft`/`faceRight`),供 ⑧ 轮廓提取判断"两侧是否皆 Solid"。
 
-> **正确性要点**:`TBBOUNDARY`/`TBALL` 取所有有界面;每个最小面 = 一条边界多段线。
+### 5.7 ⑦ FaceClassifier — 路线 B 面分类 (Solid / Void)
 
-### 5.7 ⑦ LoopHierarchy — 包含树与方向归一
+> TotalBoundary 的"外轮廓 + 孔洞"= 对线工做**形态学闭合(半径 r = ClosingRadius)**后的边界。等价地逐面分类:
 
-- 用**点-在-多边形**测试(射线法)判断环之间的包含关系,构建包含树。
-- 约定输出方向:**外环 CCW、内孔 CW**(便于 Pro 阶段做面积扣除与 Hatch 岛屿)。
-- 基础版**逐环输出为独立 `LWPolyline`**(与 `BOUNDARY` 行为一致),`ParentLoopIndex` 仅作为元数据保留。
+```
+for each face F:
+    if F 是无界外面:  F.kind = Void          # 外部恒为 Void
+    else:
+        rho = MaxInscribedEmptyCircleRadius(F)   # 面内不触及任何边的最大空圆半径
+        F.kind = (rho > r) ? Void : Solid        # 大空腔=孔洞; 细小单元=被填充
+```
 
-### 5.8 ⑧ LoopRebuilder — 还原 bulge 圆弧
+**`MaxInscribedEmptyCircleRadius(F)` 求法(基础版可由简到精逐步实现):**
+- **近似法(MVP 首选)**:对面做约束三角剖分或栅格采样,取面内点到其边界的最大距离;或用面积/周长比 + 包围盒做快速近似。
+- **精确法(可选优化)**:基于面边界的广义 Voronoi / 中轴,求最大内切圆。
+- `r` 默认按 `GapTolerance` 自适应放大(经验 2–5×),用户可调以控制轮廓细节。
 
-把面遍历得到的"直线边链"凭 provenance 还原为精确多段线:
+**正确性要点(几个判例):**
+- **大矩形(4 线)**:内部面 ρ 很大 → Void;外部无界面 → Void。两侧皆 Void 的 4 条实体边在 ⑧ 被保留 → 输出即矩形(不会因"内部是 Void"而丢失,因为 ⑧ 只在"两侧皆 Solid"时丢边)。
+- **稠密网格(# 形 N×N)**:每个小格 ρ ≤ r → Solid;内部边两侧皆 Solid → ⑧ 丢弃;仅外周界保留。
+- **donut(外环内含大空腔)**:外环带状区的小单元=Solid,中心大空腔 ρ>r=Void → 外轮廓 + 1 孔洞。
+
+### 5.8 ⑧ OutlineBuilder — 轮廓边提取与组装
+
+```
+keep = []
+for each 几何边 e (仅实体边, 桥接边见下):
+    Lf = e.faceLeft.kind;  Rf = e.faceRight.kind
+    if not (Lf == Solid and Rf == Solid):   # 两侧皆 Solid 才丢弃(属实心内部)
+        keep.add(e)
+# 桥接边: 仅当其位于保留轮廓上、用于闭合缝隙时保留(否则丢弃)
+# 将 keep 中的边按公共顶点拓扑串联为闭合环:
+#   - 一个连通片段的外周界 → 外轮廓环(CCW)
+#   - 实心与空腔之间的边 → 孔洞环(CW)
+#   - 多个不连通片段 → 各自的外轮廓
+assemble keep -> List<RawLoop>(标注 IsOuter / ParentLoopIndex)
+```
+
+**要点:**
+- 判据"**两侧皆 Solid 才丢弃**"统一覆盖了所有判例(矩形、网格、donut、多片段)。
+- 在每个顶点串联时,若度数 > 2(多边交汇),按角度选择保持轮廓走向的下一条边(类似面遍历的 next-edge 规则)。
+- 用有符号面积归一方向:外轮廓 CCW、孔洞 CW;`ParentLoopIndex` 标注孔属于哪个外轮廓。
+
+### 5.9 ⑨ LoopRebuilder — 还原 bulge 圆弧
+
+把 ⑧ 得到的"直线边链"凭 provenance 还原为精确多段线:
 
 ```
 for each RawLoop:
@@ -353,9 +400,10 @@ for each RawLoop:
         - 源是 Arc   → LoopSegment{Arc,  End=子弧终点, Bulge=tan(Δangle/4)}
                        (Δangle 由合并后的起止角得到, 子弧也精确)
         - 源是 Ellipse/Spline → 保留为多条 Line 段(已线性化)
+        - 源是桥接边 → 输出为直线段(缝隙以直线闭合)
 ```
-- **bulge 符号**取决于子弧的转向(CCW 为正)与环的遍历方向,需据实际走向定号。
-- 这样 Arc/Circle 在输出中**精确无损**,而 Spline/Ellipse 为受控精度的折线。
+- **bulge 符号**取决于子弧转向(CCW 为正)与环的遍历方向,据实际走向定号。
+- Arc/Circle 在输出中**精确无损**,Spline/Ellipse 为受控精度折线,桥接缝以直线连接。
 
 ---
 
@@ -420,36 +468,42 @@ foreach (var loop in result.Loops)
 
 ## 七、三命令交互流程
 
-### 7.1 `TBBOUNDARY` — 选择对象
+### 7.1 `TOTALBOUNDARY` / `TB` — 选对象出轮廓(主命令)
+
+对齐真实产品的 `Select objects or [SEttings/ABout]` 交互。
 
 ```
-1. PromptSelectionOptions: 允许窗口/交叉/点选对象, 过滤支持的实体类型
-2. 锁文档 + 读事务 → EntityExtractor 取 InputCurve[]
-3. BoundaryExtractor.Extract(Mode=AllLoops)
-4. PolylineWriter 写回所有闭合环
-5. 报告: "提取 N 条边界, 桥接 M 处间隙, 剔除 K 个无效实体"
+1. PromptSelectionOptions: 允许窗口/交叉/点选对象; 关键字 SEttings(改容差/半径/属性)、ABout
+2. 过滤支持的实体类型
+3. 锁文档 + 读事务 → EntityExtractor 取 InputCurve[]
+4. BoundaryExtractor.Extract(Mode=SelectedObjects)
+5. PolylineWriter 写回外轮廓 + 孔洞多段线
+6. 报告: "生成 N 条轮廓(含 H 个孔), 桥接 M 处间隙, 忽略 K 条悬挂线"
 ```
 
-### 7.2 `TBQUICKPICK` — 点选区域 (BPOLY 行为)
-
-```
-1. PromptPoint: 取内部拾取点(可循环多次)
-2. 候选实体: 以拾取点为中心的窗口做 SelectCrossingWindow, 或取当前空间全部(带网格过滤)
-3. EntityExtractor → BoundaryExtractor.Extract(Mode=PointPick, pickPoint)
-   - Core 内: 构建平面图后做"点定位":
-       a. 从 pickPoint 向 +X 射线, 求与所有边交点, 取最近交点所在半边
-       b. 选使 pickPoint 落在其左侧的半边方向, FaceTracer 仅追踪该面
-   - 若 pickPoint 不被任何闭合面包围 → 报"未找到封闭边界"
-4. 写回该面边界; 支持连续点选累积
-```
-
-### 7.3 `TBALL` — 全图提取
+### 7.2 `TBALL` — 全图轮廓
 
 ```
 1. 取当前空间(模型/图纸)全部支持实体(无需用户选择)
-2. EntityExtractor → Extract(Mode=AllLoops)
+2. EntityExtractor → Extract(Mode=SelectedObjects)
 3. 大图: 强制显示进度条 + Esc 中断
-4. 写回所有闭合环
+4. 写回外轮廓 + 孔洞
+```
+
+### 7.3 `TBPICK` — 点选片段轮廓
+
+> 语义:对**拾取点所在的连通线工片段**出轮廓,而非 BPOLY 的"该点所在单个封闭面"(后者属 SuperBoundary,不在范围)。
+
+```
+1. PromptPoint: 取拾取点(可循环多次)
+2. 候选实体: 当前空间全部支持实体(或拾取点邻域窗口预过滤)
+3. EntityExtractor → BoundaryExtractor.Extract(Mode=FragmentAtPoint, pickPoint)
+   - Core 内:
+       a. 构建平面图后, 找拾取点所在面;
+       b. 由该面回溯其所属的连通分量(片段);
+       c. 仅对该片段执行 ⑦ 面分类 + ⑧ 轮廓提取
+   - 若拾取点落在无界外面且不属任何片段 → 报"该点不在任何图形片段内"
+4. 写回该片段轮廓; 支持连续点选累积
 ```
 
 ---
@@ -459,6 +513,7 @@ foreach (var loop in result.Loops)
 | 容差 | 默认 | 作用 |
 |------|------|------|
 | `GapTolerance` | 0.001 | 端点聚类桥接(5.4),用户主调参数 |
+| `ClosingRadius` (r) | ≈2–5×GapTolerance(自适应)| 路线 B 面分类:ρ>r→孔洞,ρ≤r→填充。控制轮廓细节 |
 | `GeomEpsilon` | 1e-9 ×包围盒尺度 | 相交/共线/叉积判定基准 |
 | `MaxSagitta` | 自适应 | Spline/Ellipse 线性化精度 |
 | `MaxArcStepDeg` | 15° | 圆弧展平/线性化角步上限 |
@@ -482,17 +537,18 @@ foreach (var loop in result.Loops)
 | TB.Core | `Geometry/UniformGrid.cs` | 均匀网格空间索引 | ✅ |
 | TB.Core | `Geometry/SegmentIntersector.cs` | 线段求交并打断 | ✅ |
 | TB.Core | `Geometry/VertexMerger.cs` | 端点容差聚类(并查集) | ✅ |
-| TB.Core | `Geometry/PlanarGraphBuilder.cs` | 半边结构 + 极角排序 | ✅ |
-| TB.Core | `Geometry/FaceTracer.cs` | 面遍历提取环 | ✅ |
-| TB.Core | `Geometry/LoopHierarchy.cs` | 包含树 + 方向归一 | ✅ |
+| TB.Core | `Geometry/PlanarGraphBuilder.cs` | 半边结构 + 极角排序 + 边两侧面登记 | ✅ |
+| TB.Core | `Geometry/FaceTracer.cs` | 面遍历得到所有面 | ✅ |
+| TB.Core | `Geometry/FaceClassifier.cs` | **路线 B: Solid/Void 分类(内切空圆 vs r)** | ✅ |
+| TB.Core | `Geometry/OutlineBuilder.cs` | **轮廓边提取 + 组装外轮廓/孔洞环** | ✅ |
 | TB.Core | `Geometry/LoopRebuilder.cs` | 还原 bulge 圆弧 | ✅ |
 | TB.Core | `Geometry/RobustPredicates.cs` | 叉积/朝向/共线判定 | ✅ |
-| TB.Core | `BoundaryExtractor.cs` | 门面,串联流水线 | ✅ |
+| TB.Core | `OutlineExtractorService.cs` | 门面(IBoundaryExtractor),串联流水线 | ✅ |
 | TB.AutoCAD | `Services/EntityExtractor.cs` | DBObject→InputCurve(投影/块展开) | 集成 |
 | TB.AutoCAD | `Services/PolylineWriter.cs` | BoundaryLoop→LWPolyline | 集成 |
 | TB.AutoCAD | `Services/UcsService.cs` | UCS↔WCS 变换 | 集成 |
 | TB.AutoCAD | `Services/{Selection,Layer,Progress}Service.cs` | 选择/图层/进度 | 集成 |
-| TB.AutoCAD | `Commands/{TBoundary,TBQuickPick,TBAll}.cs` | 命令入口 | 集成 |
+| TB.AutoCAD | `Commands/{TotalBoundaryCmd,TBAll,TBPick}.cs` | 命令入口 | 集成 |
 
 ---
 
@@ -500,50 +556,57 @@ foreach (var loop in result.Loops)
 
 | 步骤 | 实现 | 验收样例(可单测/集成) |
 |------|------|------|
-| 1 | 数据模型 + BoundaryExtractor 空壳 | 项目编译,门面可调用 |
+| 1 | 数据模型 + OutlineExtractorService 空壳 | 项目编译,门面可调用 |
 | 2 | Tessellator | 圆/弧/样条展平点数随 sagitta 收敛;Line 不变 |
 | 3 | UniformGrid + RobustPredicates | 邻域查询正确;叉积/朝向单测通过 |
 | 4 | SegmentIntersector | 1 个十字交叉 → 4 条子边,交点唯一 |
 | 5 | VertexMerger | 0.5mm 间隙的矩形 4 边 → 4 顶点(桥接成功) |
-| 6 | PlanarGraphBuilder + FaceTracer | 矩形→1 内面;两相邻矩形→3 面(共享边) |
-| 7 | LoopHierarchy | 外框+内框 → 2 环,包含关系正确,方向归一 |
-| 8 | LoopRebuilder | 含圆弧矩形 → 输出含 bulge,重建几何≈原弧 |
-| 9 | EntityExtractor + PolylineWriter | 在 AutoCAD 中矩形/圆/带弧图形提取正确 |
-| 10 | 三命令 | TBBOUNDARY/QUICKPICK/ALL 均可用 |
-| 11 | 进度/中断 + 诊断 | 1000+ 实体 < 5s,可 Esc;诊断输出合理 |
-| 12 | 对比验证 | 干净图与原生 BOUNDARY 一致;带间隙图本插件成功而原生失败 |
+| 6 | PlanarGraphBuilder + FaceTracer | 矩形→1 面;两相邻矩形→3 面;边两侧面登记正确 |
+| 7 | **FaceClassifier(路线 B)** | 大空腔=Void;小单元=Solid;闭合半径变化致分类切换 |
+| 8 | **OutlineBuilder** | 稠密网格→仅外轮廓;donut→外轮廓+1 孔;多片段→多外轮廓 |
+| 9 | LoopRebuilder | 含圆弧矩形 → 输出含 bulge,重建几何≈原弧 |
+| 10 | EntityExtractor + PolylineWriter | 在 AutoCAD 中矩形/圆/带弧图形轮廓正确 |
+| 11 | 三命令 | TOTALBOUNDARY/TBALL/TBPICK 均可用 |
+| 12 | 进度/中断 + 诊断 | 10000+ 实体 ≤ 5s,可 Esc;诊断输出合理 |
+| 13 | 对比验证 | 选定片段轮廓符合预期;带间隙图本插件成功而原生失败 |
 
 ---
 
 ## 十一、关键测试用例(TB.Core 单测,无需 AutoCAD)
 
 ```
-[矩形-纯直线]      4 Line 首尾相接           → 1 环, 4 段, 全 Line
-[矩形-带间隙]      4 Line 各留 0.5mm 缝       → 容差 1mm: 1 环; 容差 0.1mm: 0 环
-[圆]               1 Circle                   → 1 环, 2 段 Arc(bulge=±1)
-[圆角矩形]         4 Line + 4 Arc             → 1 环, 8 段(4 Line+4 Arc bulge)
-[十字交叉]         2 条交叉 Line              → 中段打断, 不成环(开放)
-[井字/四格]        # 形 4 线交叉              → 4 个最小面 + 边界面
-[嵌套环]           外矩形 + 内矩形(不连)      → 2 环, 内环 IsOuter=false
+[矩形-纯直线]      4 Line 首尾相接           → 1 条外轮廓, 4 段全 Line
+[矩形-带间隙]      4 Line 各留 0.5mm 缝       → 容差 1mm: 1 条轮廓; 容差 0.1mm: 0 条
+[圆]               1 Circle                   → 1 条外轮廓, 2 段 Arc(bulge=±1)
+[圆角矩形]         4 Line + 4 Arc             → 1 条外轮廓, 8 段(4 Line+4 Arc bulge)
+[十字交叉]         2 条交叉 Line              → 中段打断; 无面→无轮廓(纯悬挂)
+[稠密网格]         # 形 N×N 线交叉(小格)     → 仅 1 条外周界(内部边不输出, 小格=Solid)
+[donut]            外框 + 大空腔(r 内)        → 外轮廓 + 1 孔洞(空腔 ρ>r=Void)
+[网格-小 r]        同上网格但 r 调小          → 小格变 Void → 出现多个孔(验证 r 敏感性)
+[多片段]           两个不相连的矩形           → 2 条独立外轮廓
+[嵌套环]           外矩形 + 内矩形(中间空)    → 外轮廓 + 1 孔(IsOuter=false)
 [T 形搭接]         一线端点落在另一线中段     → 打断且顶点合并
-[样条闭合]         1 闭合 Spline              → 1 环, 多 Line 段(矢高内)
-[点选-PointPick]   井字内某格点选            → 仅该格 1 环
-[退化]             零长线/重复线             → 剔除, 进诊断, 不崩溃
+[样条闭合]         1 闭合 Spline              → 1 条外轮廓, 多 Line 段(矢高内)
+[片段点选]         多片段中点选其一           → 仅该片段轮廓
+[退化]             零长线/重复线/孤立悬挂线   → 剔除/忽略, 进诊断, 不崩溃
 ```
 
 ---
 
 ## 十二、与原生命令的核心差异验证(基础版即体现)
 
-| 场景 | 原生 BOUNDARY/BPOLY | 基础版预期 |
+| 场景 | 原生 BOUNDARY/BPOLY | 基础版预期(TotalBoundary 语义) |
 |------|--------------------|-----------|
-| 有 0.5mm 缝隙的"封闭"图 | 报"未找到有效边界" | 容差内自动桥接成环 ✅ |
-| 中段交叉但视觉封闭 | 依赖显示精度,易失败 | 显式打断成面 ✅ |
+| 目标 | 点选点的单个封闭面 | 选定对象集合的**整体外轮廓 + 孔洞** |
+| 复杂图整体轮廓 | 需手动加包围框/逐个拼 | 选中即出外轮廓 ✅ |
+| 有 0.5mm 缝隙的"封闭"图 | 报"未找到有效边界" | 容差内自动桥接 ✅ |
+| 中段交叉但视觉封闭 | 依赖显示精度,易失败 | 显式打断 ✅ |
 | 含圆弧边界 | 可成功 | 成功且 bulge 无损 ✅ |
-| 容差/采样调节 | 不可控 | 全参数化 ✅ |
+| 悬挂/多余线 | 常需预清理 | 自动忽略 ✅ |
+| 容差/细节调节 | 不可控 | GapTolerance + ClosingRadius 全参数化 ✅ |
 
-> 基础版即应在"间隙桥接 + 中段相交"两点上**明显优于**原生命令,这是 TotalBoundary 的核心卖点。
+> 基础版即应在"**整体外轮廓提取 + 间隙桥接 + 中段相交 + 免预清理**"上**明显优于**原生命令,这正是 TotalBoundary 的核心卖点(轮廓生成器,而非逐面提取)。
 
 ---
 
-> 本设计与 `totalboundary-dev-plan-v2.md` 配套:主方案描述总体架构与分级,本文件给出基础版可直接编码的详细设计(数据模型、算法伪代码、命令流程、验收关卡)。后续可据此生成 TB.Core / TB.AutoCAD 的解决方案骨架代码。
+> 本设计与 `totalboundary-dev-plan-v2.md`(v2.1)配套:主方案描述总体架构与分级,本文件给出基础版可直接编码的详细设计(数据模型、算法伪代码、命令流程、验收关卡)。核心已对齐 TotalBoundary 的"外轮廓 + 孔洞"语义(路线 B)。后续可据此生成 TB.Core / TB.AutoCAD 的解决方案骨架代码。
